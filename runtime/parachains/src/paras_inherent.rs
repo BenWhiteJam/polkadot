@@ -31,6 +31,7 @@ use frame_support::{
 	dispatch::DispatchResultWithPostInfo,
 	weights::{DispatchClass, Weight},
 	traits::Get,
+	inherent::{InherentIdentifier, InherentData, MakeFatalError, ProvideInherent},
 };
 use frame_system::ensure_none;
 use crate::{
@@ -38,7 +39,6 @@ use crate::{
 	scheduler::{self, FreedReason},
 	ump,
 };
-use inherents::{InherentIdentifier, InherentData, MakeFatalError, ProvideInherent};
 
 const LOG_TARGET: &str = "runtime::inclusion-inherent";
 // In the future, we should benchmark these consts; these are all untested assumptions for now.
@@ -53,7 +53,7 @@ decl_storage! {
 	trait Store for Module<T: Config> as ParaInherent {
 		/// Whether the paras inherent was included within this block.
 		///
-		/// The `Option<()>` is effectively a bool, but it never hits storage in the `None` variant
+		/// The `Option<()>` is effectively a `bool`, but it never hits storage in the `None` variant
 		/// due to the guarantees of FRAME's storage APIs.
 		///
 		/// If this is `None` at the end of the block, we panic and render the block invalid.
@@ -256,6 +256,10 @@ impl<T: Config> ProvideInherent for Module<T> {
 		};
 
 		Some(Call::enter(inherent_data))
+	}
+
+	fn is_inherent(call: &Self::Call) -> bool {
+		matches!(call, Call::enter(..))
 	}
 }
 

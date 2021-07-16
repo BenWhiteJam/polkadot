@@ -24,6 +24,7 @@ use frame_support::{
 	decl_storage, decl_module, decl_error, decl_event, ensure, traits::{Get, ReservableCurrency},
 	weights::Weight, StorageMap, StorageValue, dispatch::DispatchResult,
 };
+use frame_system::ensure_root;
 use primitives::v1::{
 	Balance, Hash, HrmpChannelId, Id as ParaId, InboundHrmpMessage, OutboundHrmpMessage,
 	SessionIndex,
@@ -241,7 +242,7 @@ decl_storage! {
 		HrmpOpenChannelRequests: map hasher(twox_64_concat) HrmpChannelId => Option<HrmpOpenChannelRequest>;
 		HrmpOpenChannelRequestsList: Vec<HrmpChannelId>;
 
-		/// This mapping tracks how many open channel requests are inititated by a given sender para.
+		/// This mapping tracks how many open channel requests are initiated by a given sender para.
 		/// Invariant: `HrmpOpenChannelRequests` should contain the same number of items that has `(X, _)`
 		/// as the number of `HrmpOpenChannelRequestCount` for `X`.
 		HrmpOpenChannelRequestCount: map hasher(twox_64_concat) ParaId => u32;
@@ -290,7 +291,7 @@ decl_storage! {
 		/// Invariant: cannot be non-empty if the corresponding channel in `HrmpChannels` is `None`.
 		HrmpChannelContents: map hasher(twox_64_concat) HrmpChannelId => Vec<InboundHrmpMessage<T::BlockNumber>>;
 		/// Maintains a mapping that can be used to answer the question:
-		/// What paras sent a message at the given block number for a given reciever.
+		/// What paras sent a message at the given block number for a given receiver.
 		/// Invariants:
 		/// - The inner `Vec<ParaId>` is never empty.
 		/// - The inner `Vec<ParaId>` cannot store two same `ParaId`.
@@ -298,6 +299,51 @@ decl_storage! {
 		///   block number.
 		HrmpChannelDigests: map hasher(twox_64_concat) ParaId => Vec<(T::BlockNumber, Vec<ParaId>)>;
 	}
+	add_extra_genesis {
+		/// Preopen the given HRMP channels.
+		///
+		/// The values in the tuple corresponds to `(sender, recipient, max_capacity, max_message_size)`,
+		/// i.e. similar to `init_open_channel`. In fact, the initialization is performed as if
+		/// the `init_open_channel` and `accept_open_channel` were called with the respective parameters
+		/// and the session change take place.
+		///
+		/// As such, each channel initializer should satisfy the same constraints, namely:
+		///
+		/// 1. `max_capacity` and `max_message_size` should be within the limits set by the configuration module.
+		/// 2. `sender` and `recipient` must be valid paras.
+		config(preopen_hrmp_channels): Vec<(ParaId, ParaId, u32, u32)>;
+		build(|config| {
+			initialize_storage::<T>(&config.preopen_hrmp_channels);
+		})
+	}
+}
+
+#[cfg(feature = "std")]
+fn initialize_storage<T: Config>(preopen_hrmp_channels: &[(ParaId, ParaId, u32, u32)]) {
+	let host_config = configuration::Module::<T>::config();
+	for &(sender, recipient, max_capacity, max_message_size) in preopen_hrmp_channels {
+		if let Err(err) = preopen_hrmp_channel::<T>(sender, recipient, max_capacity, max_message_size) {
+			panic!("failed to initialize the genesis storage: {:?}", err);
+		}
+	}
+	<Module<T>>::process_hrmp_open_channel_requests(&host_config);
+}
+
+#[cfg(feature = "std")]
+fn preopen_hrmp_channel<T: Config>(
+	sender: ParaId,
+	recipient: ParaId,
+	max_capacity: u32,
+	max_message_size: u32
+) -> DispatchResult {
+	<Module<T>>::init_open_channel(
+		sender,
+		recipient,
+		max_capacity,
+		max_message_size,
+	)?;
+	<Module<T>>::accept_open_channel(recipient, sender)?;
+	Ok(())
 }
 
 decl_error! {
@@ -338,11 +384,11 @@ decl_error! {
 decl_event! {
 	pub enum Event {
 		/// Open HRMP channel requested.
-		/// \[sender, recipient, proposed_max_capacity, proposed_max_message_size\]
+		/// `[sender, recipient, proposed_max_capacity, proposed_max_message_size]`
 		OpenChannelRequested(ParaId, ParaId, u32, u32),
-		/// Open HRMP channel accepted. \[sender, recipient\]
+		/// Open HRMP channel accepted. `[sender, recipient]`
 		OpenChannelAccepted(ParaId, ParaId),
-		/// HRMP channel closed. \[by_parachain, channel_id\]
+		/// HRMP channel closed. `[by_parachain, channel_id]`
 		ChannelClosed(ParaId, HrmpChannelId),
 	}
 }
@@ -407,6 +453,41 @@ decl_module! {
 			let origin = ensure_parachain(<T as Config>::Origin::from(origin))?;
 			Self::close_channel(origin, channel_id.clone())?;
 			Self::deposit_event(Event::ChannelClosed(origin, channel_id));
+			Ok(())
+		}
+
+		/// This extrinsic triggers the cleanup of all the HRMP storage items that
+		/// a para may have. Normally this happens once per session, but this allows
+		/// you to trigger the cleanup immediately for a specific parachain.
+		///
+		/// Origin must be Root.
+		#[weight = 0]
+		pub fn force_clean_hrmp(origin, para: ParaId) -> DispatchResult {
+			ensure_root(origin)?;
+			Self::clean_hrmp_after_outgoing(&para);
+			Ok(())
+		}
+
+		/// Force process HRMP open channel requests.
+		///
+		/// If there are pending HRMP open channel requests, you can use this
+		/// function process all of those requests immediately.
+		#[weight = 0]
+		pub fn force_process_hrmp_open(origin) -> DispatchResult {
+			ensure_root(origin)?;
+			let host_config = configuration::Module::<T>::config();
+			Self::process_hrmp_open_channel_requests(&host_config);
+			Ok(())
+		}
+
+		/// Force process HRMP close channel requests.
+		///
+		/// If there are pending HRMP close channel requests, you can use this
+		/// function process all of those requests immediately.
+		#[weight = 0]
+		pub fn force_process_hrmp_close(origin) -> DispatchResult {
+			ensure_root(origin)?;
+			Self::process_hrmp_close_channel_requests();
 			Ok(())
 		}
 	}
@@ -492,8 +573,8 @@ impl<T: Config> Module<T> {
 			);
 
 			if request.confirmed {
-				if <paras::Module<T>>::is_valid_para(channel_id.sender)
-					&& <paras::Module<T>>::is_valid_para(channel_id.recipient)
+				if <paras::Pallet<T>>::is_valid_para(channel_id.sender)
+					&& <paras::Pallet<T>>::is_valid_para(channel_id.recipient)
 				{
 					<Self as Store>::HrmpChannels::insert(
 						&channel_id,
@@ -586,7 +667,7 @@ impl<T: Config> Module<T> {
 	///
 	/// This includes returning the deposits.
 	///
-	/// This function is indempotent, meaning that after the first application it should have no
+	/// This function is idempotent, meaning that after the first application it should have no
 	/// effect (i.e. it won't return the deposits twice).
 	fn close_hrmp_channel(channel_id: &HrmpChannelId) {
 		if let Some(HrmpChannel {
@@ -891,7 +972,7 @@ impl<T: Config> Module<T> {
 	) -> DispatchResult {
 		ensure!(origin != recipient, Error::<T>::OpenHrmpChannelToSelf);
 		ensure!(
-			<paras::Module<T>>::is_valid_para(recipient),
+			<paras::Pallet<T>>::is_valid_para(recipient),
 			Error::<T>::OpenHrmpChannelInvalidRecipient,
 		);
 
@@ -929,7 +1010,7 @@ impl<T: Config> Module<T> {
 		let egress_cnt =
 			<Self as Store>::HrmpEgressChannelsIndex::decode_len(&origin).unwrap_or(0) as u32;
 		let open_req_cnt = <Self as Store>::HrmpOpenChannelRequestCount::get(&origin);
-		let channel_num_limit = if <paras::Module<T>>::is_parathread(origin) {
+		let channel_num_limit = if <paras::Pallet<T>>::is_parathread(origin) {
 			config.hrmp_max_parathread_outbound_channels
 		} else {
 			config.hrmp_max_parachain_outbound_channels
@@ -959,7 +1040,7 @@ impl<T: Config> Module<T> {
 		<Self as Store>::HrmpOpenChannelRequestsList::append(channel_id);
 
 		let notification_bytes = {
-			use xcm::{v0::Xcm, VersionedXcm};
+			use xcm::opaque::{v0::Xcm, VersionedXcm};
 			use parity_scale_codec::Encode as _;
 
 			VersionedXcm::from(Xcm::HrmpNewChannelOpenRequest {
@@ -999,7 +1080,7 @@ impl<T: Config> Module<T> {
 		// check if by accepting this open channel request, this parachain would exceed the
 		// number of inbound channels.
 		let config = <configuration::Module<T>>::config();
-		let channel_num_limit = if <paras::Module<T>>::is_parathread(origin) {
+		let channel_num_limit = if <paras::Pallet<T>>::is_parathread(origin) {
 			config.hrmp_max_parathread_inbound_channels
 		} else {
 			config.hrmp_max_parachain_inbound_channels
@@ -1025,7 +1106,7 @@ impl<T: Config> Module<T> {
 
 		let notification_bytes = {
 			use parity_scale_codec::Encode as _;
-			use xcm::{v0::Xcm, VersionedXcm};
+			use xcm::opaque::{v0::Xcm, VersionedXcm};
 
 			VersionedXcm::from(Xcm::HrmpChannelAccepted {
 				recipient: u32::from(origin),
@@ -1068,7 +1149,7 @@ impl<T: Config> Module<T> {
 		let config = <configuration::Module<T>>::config();
 		let notification_bytes = {
 			use parity_scale_codec::Encode as _;
-			use xcm::{v0::Xcm, VersionedXcm};
+			use xcm::opaque::{v0::Xcm, VersionedXcm};
 
 			VersionedXcm::from(Xcm::HrmpChannelClosing {
 				initiator: u32::from(origin),
@@ -1471,13 +1552,13 @@ mod tests {
 			Hrmp::hrmp_init_open_channel(para_a_origin.into(), para_b, 2, 8).unwrap();
 			assert_storage_consistency_exhaustive();
 			assert!(System::events().iter().any(|record|
-				record.event == MockEvent::hrmp(Event::OpenChannelRequested(para_a, para_b, 2, 8))
+				record.event == MockEvent::Hrmp(Event::OpenChannelRequested(para_a, para_b, 2, 8))
 			));
 
 			Hrmp::hrmp_accept_open_channel(para_b_origin.into(), para_a).unwrap();
 			assert_storage_consistency_exhaustive();
 			assert!(System::events().iter().any(|record|
-				record.event == MockEvent::hrmp(Event::OpenChannelAccepted(para_a, para_b))
+				record.event == MockEvent::Hrmp(Event::OpenChannelAccepted(para_a, para_b))
 			));
 
 			// Advance to a block 6, but without session change. That means that the channel has
@@ -1524,7 +1605,7 @@ mod tests {
 			assert!(!channel_exists(para_a, para_b));
 			assert_storage_consistency_exhaustive();
 			assert!(System::events().iter().any(|record|
-				record.event == MockEvent::hrmp(Event::ChannelClosed(para_b, channel_id.clone()))
+				record.event == MockEvent::Hrmp(Event::ChannelClosed(para_b, channel_id.clone()))
 			));
 		});
 	}

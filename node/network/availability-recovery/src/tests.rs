@@ -33,16 +33,14 @@ use polkadot_node_primitives::{PoV, BlockData};
 use polkadot_erasure_coding::{branches, obtain_chunks_v1 as obtain_chunks};
 use polkadot_node_subsystem_util::TimeoutExt;
 use polkadot_subsystem_testhelpers as test_helpers;
-use polkadot_subsystem::{messages::{RuntimeApiMessage, RuntimeApiRequest}, jaeger, ActivatedLeaf};
+use polkadot_subsystem::{
+	messages::{AllMessages, RuntimeApiMessage, RuntimeApiRequest}, jaeger, ActivatedLeaf, LeafStatus,
+};
 
 type VirtualOverseer = test_helpers::TestSubsystemContextHandle<AvailabilityRecoveryMessage>;
 
-struct TestHarness {
-	virtual_overseer: VirtualOverseer,
-}
-
-fn test_harness_fast_path<T: Future<Output = ()>>(
-	test: impl FnOnce(TestHarness) -> T,
+fn test_harness_fast_path<T: Future<Output = VirtualOverseer>>(
+	test: impl FnOnce(VirtualOverseer) -> T,
 ) {
 	let _ = env_logger::builder()
 		.is_test(true)
@@ -59,16 +57,19 @@ fn test_harness_fast_path<T: Future<Output = ()>>(
 	let subsystem = AvailabilityRecoverySubsystem::with_fast_path();
 	let subsystem = subsystem.run(context);
 
-	let test_fut = test(TestHarness { virtual_overseer });
+	let test_fut = test(virtual_overseer);
 
 	futures::pin_mut!(test_fut);
 	futures::pin_mut!(subsystem);
 
-	executor::block_on(future::select(test_fut, subsystem));
+	executor::block_on(future::join(async move {
+		let mut overseer = test_fut.await;
+		overseer_signal(&mut overseer, OverseerSignal::Conclude).await;
+	}, subsystem)).1.unwrap();
 }
 
-fn test_harness_chunks_only<T: Future<Output = ()>>(
-	test: impl FnOnce(TestHarness) -> T,
+fn test_harness_chunks_only<T: Future<Output = VirtualOverseer>>(
+	test: impl FnOnce(VirtualOverseer) -> T,
 ) {
 	let _ = env_logger::builder()
 		.is_test(true)
@@ -85,12 +86,15 @@ fn test_harness_chunks_only<T: Future<Output = ()>>(
 	let subsystem = AvailabilityRecoverySubsystem::with_chunks_only();
 	let subsystem = subsystem.run(context);
 
-	let test_fut = test(TestHarness { virtual_overseer });
+	let test_fut = test(virtual_overseer);
 
 	futures::pin_mut!(test_fut);
 	futures::pin_mut!(subsystem);
 
-	executor::block_on(future::select(test_fut, subsystem));
+	executor::block_on(future::join(async move {
+		let mut overseer = test_fut.await;
+		overseer_signal(&mut overseer, OverseerSignal::Conclude).await;
+	}, subsystem)).1.unwrap();
 }
 
 const TIMEOUT: Duration = Duration::from_millis(100);
@@ -439,15 +443,14 @@ impl Default for TestState {
 fn availability_is_recovered_from_chunks_if_no_group_provided() {
 	let test_state = TestState::default();
 
-	test_harness_fast_path(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_fast_path(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -514,6 +517,7 @@ fn availability_is_recovered_from_chunks_if_no_group_provided() {
 
 		// A request times out with `Unavailable` error.
 		assert_eq!(rx.await.unwrap().unwrap_err(), RecoveryError::Unavailable);
+		virtual_overseer
 	});
 }
 
@@ -521,15 +525,14 @@ fn availability_is_recovered_from_chunks_if_no_group_provided() {
 fn availability_is_recovered_from_chunks_even_if_backing_group_supplied_if_chunks_only() {
 	let test_state = TestState::default();
 
-	test_harness_chunks_only(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_chunks_only(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -596,6 +599,7 @@ fn availability_is_recovered_from_chunks_even_if_backing_group_supplied_if_chunk
 
 		// A request times out with `Unavailable` error.
 		assert_eq!(rx.await.unwrap().unwrap_err(), RecoveryError::Unavailable);
+		virtual_overseer
 	});
 }
 
@@ -603,15 +607,14 @@ fn availability_is_recovered_from_chunks_even_if_backing_group_supplied_if_chunk
 fn bad_merkle_path_leads_to_recovery_error() {
 	let mut test_state = TestState::default();
 
-	test_harness_fast_path(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_fast_path(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -653,6 +656,7 @@ fn bad_merkle_path_leads_to_recovery_error() {
 
 		// A request times out with `Unavailable` error.
 		assert_eq!(rx.await.unwrap().unwrap_err(), RecoveryError::Unavailable);
+		virtual_overseer
 	});
 }
 
@@ -660,15 +664,14 @@ fn bad_merkle_path_leads_to_recovery_error() {
 fn wrong_chunk_index_leads_to_recovery_error() {
 	let mut test_state = TestState::default();
 
-	test_harness_fast_path(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_fast_path(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -709,6 +712,7 @@ fn wrong_chunk_index_leads_to_recovery_error() {
 
 		// A request times out with `Unavailable` error as there are no good peers.
 		assert_eq!(rx.await.unwrap().unwrap_err(), RecoveryError::Unavailable);
+		virtual_overseer
 	});
 }
 
@@ -716,9 +720,7 @@ fn wrong_chunk_index_leads_to_recovery_error() {
 fn invalid_erasure_coding_leads_to_invalid_error() {
 	let mut test_state = TestState::default();
 
-	test_harness_fast_path(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_fast_path(|mut virtual_overseer| async move {
 		let pov = PoV {
 			block_data: BlockData(vec![69; 64]),
 		};
@@ -743,6 +745,7 @@ fn invalid_erasure_coding_leads_to_invalid_error() {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -775,6 +778,7 @@ fn invalid_erasure_coding_leads_to_invalid_error() {
 
 		// f+1 'valid' chunks can't produce correct data.
 		assert_eq!(rx.await.unwrap().unwrap_err(), RecoveryError::Invalid);
+		virtual_overseer
 	});
 }
 
@@ -782,15 +786,14 @@ fn invalid_erasure_coding_leads_to_invalid_error() {
 fn fast_path_backing_group_recovers() {
 	let test_state = TestState::default();
 
-	test_harness_fast_path(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_fast_path(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -828,6 +831,7 @@ fn fast_path_backing_group_recovers() {
 
 		// Recovered data should match the original one.
 		assert_eq!(rx.await.unwrap().unwrap(), test_state.available_data);
+		virtual_overseer
 	});
 }
 
@@ -835,15 +839,14 @@ fn fast_path_backing_group_recovers() {
 fn no_answers_in_fast_path_causes_chunk_requests() {
 	let test_state = TestState::default();
 
-	test_harness_fast_path(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_fast_path(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -891,6 +894,7 @@ fn no_answers_in_fast_path_causes_chunk_requests() {
 
 		// Recovered data should match the original one.
 		assert_eq!(rx.await.unwrap().unwrap(), test_state.available_data);
+		virtual_overseer
 	});
 }
 
@@ -898,15 +902,14 @@ fn no_answers_in_fast_path_causes_chunk_requests() {
 fn task_canceled_when_receivers_dropped() {
 	let test_state = TestState::default();
 
-	test_harness_chunks_only(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_chunks_only(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -929,7 +932,7 @@ fn task_canceled_when_receivers_dropped() {
 
 		for _ in 0..test_state.validators.len() {
 			match virtual_overseer.recv().timeout(TIMEOUT).await {
-				None => return,
+				None => return virtual_overseer,
 				Some(_) => continue,
 			}
 		}
@@ -942,15 +945,14 @@ fn task_canceled_when_receivers_dropped() {
 fn chunks_retry_until_all_nodes_respond() {
 	let test_state = TestState::default();
 
-	test_harness_chunks_only(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_chunks_only(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -994,6 +996,7 @@ fn chunks_retry_until_all_nodes_respond() {
 
 		// Recovered data should match the original one.
 		assert_eq!(rx.await.unwrap().unwrap_err(), RecoveryError::Unavailable);
+		virtual_overseer
 	});
 }
 
@@ -1001,15 +1004,14 @@ fn chunks_retry_until_all_nodes_respond() {
 fn returns_early_if_we_have_the_data() {
 	let test_state = TestState::default();
 
-	test_harness_chunks_only(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_chunks_only(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -1032,6 +1034,7 @@ fn returns_early_if_we_have_the_data() {
 		test_state.respond_to_available_data_query(&mut virtual_overseer, true).await;
 
 		assert_eq!(rx.await.unwrap().unwrap(), test_state.available_data);
+		virtual_overseer
 	});
 }
 
@@ -1039,15 +1042,14 @@ fn returns_early_if_we_have_the_data() {
 fn does_not_query_local_validator() {
 	let test_state = TestState::default();
 
-	test_harness_chunks_only(|test_harness| async move {
-		let TestHarness { mut virtual_overseer } = test_harness;
-
+	test_harness_chunks_only(|mut virtual_overseer| async move {
 		overseer_signal(
 			&mut virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
 				activated: smallvec![ActivatedLeaf {
 					hash: test_state.current.clone(),
 					number: 1,
+					status: LeafStatus::Fresh,
 					span: Arc::new(jaeger::Span::Disabled),
 				}],
 				deactivated: smallvec![],
@@ -1096,5 +1098,6 @@ fn does_not_query_local_validator() {
 		).await;
 
 		assert_eq!(rx.await.unwrap().unwrap(), test_state.available_data);
+		virtual_overseer
 	});
 }

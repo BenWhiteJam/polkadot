@@ -12,9 +12,9 @@ struct HostConfiguration {
 	pub validation_upgrade_frequency: BlockNumber,
 	/// The delay, in blocks, before a validation upgrade is applied.
 	pub validation_upgrade_delay: BlockNumber,
-	/// The acceptance period, in blocks. This is the amount of blocks after availability that validators
-	/// and fishermen have to perform secondary checks or issue reports.
-	pub acceptance_period: BlockNumber,
+	/// How long to keep code on-chain, in blocks. This should be sufficiently long that disputes
+	/// have concluded.
+	pub code_retention_period: BlockNumber,
 	/// The maximum validation code size, in bytes.
 	pub max_code_size: u32,
 	/// The maximum head-data size, in bytes.
@@ -69,7 +69,7 @@ struct HostConfiguration {
 	/// stage.
 	///
 	/// NOTE that this is a soft limit and could be exceeded.
-	pub preferred_dispatchable_upward_messages_step_weight: Weight,
+	pub ump_service_total_weight: Weight,
 	/// The maximum size of an upward message that can be sent by a candidate.
 	///
 	/// This parameter affects the upper bound of size of `CandidateCommitments`.

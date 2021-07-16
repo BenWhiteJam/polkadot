@@ -23,7 +23,7 @@
 use sp_std::prelude::*;
 use primitives::v1::{
 	CandidateCommitments, CandidateDescriptor, ValidatorIndex, Id as ParaId,
-	AvailabilityBitfield as AvailabilityBitfield, SignedAvailabilityBitfields, SigningContext,
+	AvailabilityBitfield as AvailabilityBitfield, UncheckedSignedAvailabilityBitfields, SigningContext,
 	BackedCandidate, CoreIndex, GroupIndex, CommittedCandidateReceipt,
 	CandidateReceipt, HeadData, CandidateHash,
 };
@@ -92,7 +92,7 @@ impl<H, N> CandidatePendingAvailability<H, N> {
 		self.hash
 	}
 
-	/// Get the canddiate descriptor.
+	/// Get the candidate descriptor.
 	pub(crate) fn candidate_descriptor(&self) -> &CandidateDescriptor<H> {
 		&self.descriptor
 	}
@@ -131,7 +131,7 @@ decl_storage! {
 		PendingAvailability: map hasher(twox_64_concat) ParaId
 			=> Option<CandidatePendingAvailability<T::Hash, T::BlockNumber>>;
 
-		/// The commitments of candidates pending availability, by ParaId.
+		/// The commitments of candidates pending availability, by `ParaId`.
 		PendingAvailabilityCommitments: map hasher(twox_64_concat) ParaId
 			=> Option<CandidateCommitments>;
 	}
@@ -192,11 +192,11 @@ decl_error! {
 
 decl_event! {
 	pub enum Event<T> where <T as frame_system::Config>::Hash {
-		/// A candidate was backed. [candidate, head_data]
+		/// A candidate was backed. `[candidate, head_data]`
 		CandidateBacked(CandidateReceipt<Hash>, HeadData, CoreIndex, GroupIndex),
-		/// A candidate was included. [candidate, head_data]
+		/// A candidate was included. `[candidate, head_data]`
 		CandidateIncluded(CandidateReceipt<Hash>, HeadData, CoreIndex, GroupIndex),
-		/// A candidate timed out. [candidate, head_data]
+		/// A candidate timed out. `[candidate, head_data]`
 		CandidateTimedOut(CandidateReceipt<Hash>, HeadData, CoreIndex),
 	}
 }
@@ -232,11 +232,11 @@ impl<T: Config> Module<T> {
 		for _ in <AvailabilityBitfields<T>>::drain() { }
 	}
 
-	/// Process a set of incoming bitfields. Return a vec of cores freed by candidates
+	/// Process a set of incoming bitfields. Return a `vec` of cores freed by candidates
 	/// becoming available.
 	pub(crate) fn process_bitfields(
 		expected_bits: usize,
-		signed_bitfields: SignedAvailabilityBitfields,
+		unchecked_bitfields: UncheckedSignedAvailabilityBitfields,
 		core_lookup: impl Fn(CoreIndex) -> Option<ParaId>,
 	) -> Result<Vec<CoreIndex>, DispatchError> {
 		let validators = shared::Module::<T>::active_validator_keys();
@@ -247,12 +247,13 @@ impl<T: Config> Module<T> {
 			.map(|core_para| core_para.map(|p| (p, PendingAvailability::<T>::get(&p))))
 			.collect();
 
+
 		// do sanity checks on the bitfields:
 		// 1. no more than one bitfield per validator
 		// 2. bitfields are ascending by validator index.
 		// 3. each bitfield has exactly `expected_bits`
 		// 4. signature is valid.
-		{
+		let signed_bitfields = {
 			let occupied_bitmask: BitVec<BitOrderLsb0, u8> = assigned_paras_record.iter()
 				.map(|p| p.as_ref()
 					.map_or(false, |(_id, pending_availability)| pending_availability.is_some())
@@ -266,37 +267,42 @@ impl<T: Config> Module<T> {
 				session_index,
 			};
 
-			for signed_bitfield in &signed_bitfields {
+			let mut signed_bitfields = Vec::with_capacity(unchecked_bitfields.len());
+
+			for unchecked_bitfield in unchecked_bitfields {
 				ensure!(
-					signed_bitfield.payload().0.len() == expected_bits,
+					unchecked_bitfield.unchecked_payload().0.len() == expected_bits,
 					Error::<T>::WrongBitfieldSize,
 				);
 
 				ensure!(
-					last_index.map_or(true, |last| last < signed_bitfield.validator_index()),
+					last_index.map_or(true, |last| last < unchecked_bitfield.unchecked_validator_index()),
 					Error::<T>::BitfieldDuplicateOrUnordered,
 				);
 
 				ensure!(
-					(signed_bitfield.validator_index().0 as usize) < validators.len(),
+					(unchecked_bitfield.unchecked_validator_index().0 as usize) < validators.len(),
 					Error::<T>::ValidatorIndexOutOfBounds,
 				);
 
 				ensure!(
-					occupied_bitmask.clone() & signed_bitfield.payload().0.clone() == signed_bitfield.payload().0,
+					occupied_bitmask.clone() & unchecked_bitfield.unchecked_payload().0.clone() == unchecked_bitfield.unchecked_payload().0,
 					Error::<T>::UnoccupiedBitInBitfield,
 				);
 
-				let validator_public = &validators[signed_bitfield.validator_index().0 as usize];
+				let validator_public = &validators[unchecked_bitfield.unchecked_validator_index().0 as usize];
 
-				signed_bitfield.check_signature(
-					&signing_context,
-					validator_public,
-				).map_err(|_| Error::<T>::InvalidBitfieldSignature)?;
+				last_index = Some(unchecked_bitfield.unchecked_validator_index());
 
-				last_index = Some(signed_bitfield.validator_index());
+				signed_bitfields.push(
+					unchecked_bitfield.try_into_checked(
+						&signing_context,
+						validator_public,
+					).map_err(|_| Error::<T>::InvalidBitfieldSignature)?
+				);
 			}
-		}
+			signed_bitfields
+		};
 
 		let now = <frame_system::Pallet<T>>::block_number();
 		for signed_bitfield in signed_bitfields {
@@ -447,7 +453,7 @@ impl<T: Config> Module<T> {
 				);
 
 				let validation_code_hash =
-					<paras::Module<T>>::validation_code_hash_at(para_id, now, None)
+					<paras::Pallet<T>>::validation_code_hash_at(para_id, now, None)
 					// A candidate for a parachain without current validation code is not scheduled.
 					.ok_or_else(|| Error::<T>::UnscheduledCandidate)?;
 				ensure!(
@@ -673,7 +679,7 @@ impl<T: Config> Module<T> {
 		// initial weight is config read.
 		let mut weight = T::DbWeight::get().reads_writes(1, 0);
 		if let Some(new_code) = commitments.new_validation_code {
-			weight += <paras::Module<T>>::schedule_code_upgrade(
+			weight += <paras::Pallet<T>>::schedule_code_upgrade(
 				receipt.descriptor.para_id,
 				new_code,
 				relay_parent_number + config.validation_upgrade_delay,
@@ -685,7 +691,7 @@ impl<T: Config> Module<T> {
 			receipt.descriptor.para_id,
 			commitments.processed_downward_messages,
 		);
-		weight += <ump::Module<T>>::enact_upward_messages(
+		weight += <ump::Module<T>>::receive_upward_messages(
 			receipt.descriptor.para_id,
 			commitments.upward_messages,
 		);
@@ -702,7 +708,7 @@ impl<T: Config> Module<T> {
 			Event::<T>::CandidateIncluded(plain, commitments.head_data.clone(), core_index, backing_group)
 		);
 
-		weight + <paras::Module<T>>::note_new_head(
+		weight + <paras::Pallet<T>>::note_new_head(
 			receipt.descriptor.para_id,
 			commitments.head_data,
 			relay_parent_number,
@@ -775,7 +781,7 @@ impl<T: Config> Module<T> {
 		}
 	}
 
-	/// Returns the CommittedCandidateReceipt pending availability for the para provided, if any.
+	/// Returns the `CommittedCandidateReceipt` pending availability for the para provided, if any.
 	pub(crate) fn candidate_pending_availability(para: ParaId)
 		-> Option<CommittedCandidateReceipt<T::Hash>>
 	{
@@ -863,7 +869,7 @@ impl<T: Config> CandidateCheckContext<T> {
 
 		// if any, the code upgrade attempt is allowed.
 		if let Some(new_validation_code) = new_validation_code {
-			let valid_upgrade_attempt = <paras::Module<T>>::last_code_upgrade(para_id, true)
+			let valid_upgrade_attempt = <paras::Pallet<T>>::last_code_upgrade(para_id, true)
 				.map_or(true, |last| {
 					last <= self.relay_parent_number
 						&& self.relay_parent_number.saturating_sub(last)
@@ -902,7 +908,7 @@ mod tests {
 
 	use std::sync::Arc;
 	use futures::executor::block_on;
-	use primitives::v0::PARACHAIN_KEY_TYPE_ID;
+	use primitives::{v0::PARACHAIN_KEY_TYPE_ID, v1::UncheckedSignedAvailabilityBitfield};
 	use primitives::v1::{BlockNumber, Hash};
 	use primitives::v1::{
 		SignedAvailabilityBitfield, CompactStatement as Statement, ValidityAttestation, CollatorId,
@@ -1257,7 +1263,7 @@ mod tests {
 
 				assert!(Inclusion::process_bitfields(
 					expected_bits(),
-					vec![signed],
+					vec![signed.into()],
 					&core_lookup,
 				).is_err());
 			}
@@ -1275,7 +1281,7 @@ mod tests {
 
 				assert!(Inclusion::process_bitfields(
 					expected_bits() + 1,
-					vec![signed],
+					vec![signed.into()],
 					&core_lookup,
 				).is_err());
 			}
@@ -1283,13 +1289,14 @@ mod tests {
 			// duplicate.
 			{
 				let bare_bitfield = default_bitfield();
-				let signed = block_on(sign_bitfield(
-					&keystore,
-					&validators[0],
-					ValidatorIndex(0),
-					bare_bitfield,
-					&signing_context,
-				));
+				let signed: UncheckedSignedAvailabilityBitfield =
+					block_on(sign_bitfield(
+						&keystore,
+						&validators[0],
+						ValidatorIndex(0),
+						bare_bitfield,
+						&signing_context,
+				)).into();
 
 				assert!(Inclusion::process_bitfields(
 					expected_bits(),
@@ -1307,7 +1314,7 @@ mod tests {
 					ValidatorIndex(0),
 					bare_bitfield.clone(),
 					&signing_context,
-				));
+				)).into();
 
 				let signed_1 = block_on(sign_bitfield(
 					&keystore,
@@ -1315,7 +1322,7 @@ mod tests {
 					ValidatorIndex(1),
 					bare_bitfield,
 					&signing_context,
-				));
+				)).into();
 
 				assert!(Inclusion::process_bitfields(
 					expected_bits(),
@@ -1338,7 +1345,7 @@ mod tests {
 
 				assert!(Inclusion::process_bitfields(
 					expected_bits(),
-					vec![signed],
+					vec![signed.into()],
 					&core_lookup,
 				).is_err());
 			}
@@ -1356,7 +1363,7 @@ mod tests {
 
 				assert!(Inclusion::process_bitfields(
 					expected_bits(),
-					vec![signed],
+					vec![signed.into()],
 					&core_lookup,
 				).is_ok());
 			}
@@ -1391,7 +1398,7 @@ mod tests {
 
 				assert!(Inclusion::process_bitfields(
 					expected_bits(),
-					vec![signed],
+					vec![signed.into()],
 					&core_lookup,
 				).is_ok());
 
@@ -1430,7 +1437,7 @@ mod tests {
 				assert_eq!(
 					Inclusion::process_bitfields(
 						expected_bits(),
-						vec![signed],
+						vec![signed.into()],
 						&core_lookup,
 					),
 					Ok(vec![]),
@@ -1549,7 +1556,7 @@ mod tests {
 					ValidatorIndex(i as _),
 					to_sign,
 					&signing_context,
-				)))
+				)).into())
 			}).collect();
 
 			assert!(Inclusion::process_bitfields(

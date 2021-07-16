@@ -23,6 +23,7 @@ use sp_runtime::traits::{
 };
 use primitives::v1::{AuthorityDiscoveryId, Balance, BlockNumber, Header, ValidatorIndex};
 use frame_support::parameter_types;
+use frame_support::traits::GenesisBuild;
 use frame_support_test::TestRandomness;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,14 +43,14 @@ frame_support::construct_runtime!(
 	{
 		System: frame_system::{Pallet, Call, Config, Storage, Event<T>},
 		Balances: pallet_balances::{Pallet, Call, Storage, Config<T>, Event<T>},
-		Paras: paras::{Pallet, Origin, Call, Storage, Event, Config<T>},
+		Paras: paras::{Pallet, Origin, Call, Storage, Event, Config},
 		Configuration: configuration::{Pallet, Call, Storage, Config<T>},
 		Shared: shared::{Pallet, Call, Storage},
 		Inclusion: inclusion::{Pallet, Call, Storage, Event<T>},
 		Scheduler: scheduler::{Pallet, Call, Storage},
 		Initializer: initializer::{Pallet, Call, Storage},
 		Dmp: dmp::{Pallet, Call, Storage},
-		Ump: ump::{Pallet, Call, Storage},
+		Ump: ump::{Pallet, Call, Storage, Event},
 		Hrmp: hrmp::{Pallet, Call, Storage, Event},
 		SessionInfo: session_info::{Pallet, Call, Storage},
 	}
@@ -62,7 +63,7 @@ parameter_types! {
 }
 
 impl frame_system::Config for Test {
-	type BaseCallFilter = ();
+	type BaseCallFilter = frame_support::traits::AllowAll;
 	type BlockWeights = BlockWeights;
 	type BlockLength = ();
 	type DbWeight = ();
@@ -93,6 +94,8 @@ parameter_types! {
 
 impl pallet_balances::Config for Test {
 	type MaxLocks = ();
+	type MaxReserves = ();
+	type ReserveIdentifier = [u8; 8];
 	type Balance = Balance;
 	type Event = Event;
 	type DustRemoval = ();
@@ -117,8 +120,14 @@ impl crate::paras::Config for Test {
 
 impl crate::dmp::Config for Test { }
 
+parameter_types! {
+	pub const FirstMessageFactorPercent: u64 = 100;
+}
+
 impl crate::ump::Config for Test {
+	type Event = Event;
 	type UmpSink = crate::ump::mock_sink::MockUmpSink;
+	type FirstMessageFactorPercent = FirstMessageFactorPercent;
 }
 
 impl crate::hrmp::Config for Test {
@@ -200,7 +209,7 @@ pub fn new_test_ext(state: MockGenesisConfig) -> TestExternalities {
 
 	let mut t = state.system.build_storage::<Test>().unwrap();
 	state.configuration.assimilate_storage(&mut t).unwrap();
-	state.paras.assimilate_storage(&mut t).unwrap();
+	GenesisBuild::<Test>::assimilate_storage(&state.paras, &mut t).unwrap();
 
 	t.into()
 }
@@ -209,5 +218,5 @@ pub fn new_test_ext(state: MockGenesisConfig) -> TestExternalities {
 pub struct MockGenesisConfig {
 	pub system: frame_system::GenesisConfig,
 	pub configuration: crate::configuration::GenesisConfig<Test>,
-	pub paras: crate::paras::GenesisConfig<Test>,
+	pub paras: crate::paras::GenesisConfig,
 }
